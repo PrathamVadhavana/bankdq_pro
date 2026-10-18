@@ -1,4 +1,6 @@
-import csv, random, argparse
+import csv
+import random
+import argparse
 from pathlib import Path
 from datetime import date, timedelta
 from decimal import Decimal

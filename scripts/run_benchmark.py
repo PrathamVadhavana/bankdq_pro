@@ -3,7 +3,12 @@ Measures CSV parsing + deterministic ID-index construction, not end-to-end API/D
 Run: python scripts/generate_synthetic_data.py --rows 10000 --out sample_data/generated
      python scripts/run_benchmark.py --source sample_data/generated/source_transactions.csv --repeats 5
 """
-import argparse, csv, json, platform, statistics, time
+import argparse
+import csv
+import json
+import platform
+import statistics
+import time
 from pathlib import Path
 from datetime import datetime, timezone
 
