@@ -46,6 +46,45 @@ python -m streamlit run dashboard\app.py
 
 Dashboard URL: `http://localhost:8501`.
 
+## Use the Streamlit dashboard
+
+The following walkthrough uses the included dashboard and synthetic CSV data.
+
+### 1. Configure the API and account
+
+Start the API and dashboard using the commands above. In the dashboard sidebar, confirm the API base URL, enter a username and password, and register or sign in.
+
+![BankDQ Pro batch workspace](docs/screenshots/01-create-batch.png)
+
+### 2. Create and process a batch
+
+1. Enter a batch name.
+2. Select a processing chunk size from 50 to 10,000 rows.
+3. Upload one or more source transaction CSV files.
+4. Optionally upload a ledger/reference CSV to enable reconciliation.
+5. Select **Upload and process**.
+6. Wait for the upload and server-side processing progress to complete.
+
+The source CSV must include `transaction_id` and `amount`. Use synthetic data only.
+
+### 3. Review batch history
+
+After processing completes, the batch appears in **Your batches**. Select a batch to review its status, received rows, valid rows, invalid rows, and duplicate count.
+
+![BankDQ Pro batch history](docs/screenshots/02-batch-history.png)
+
+### 4. Review quality, reconciliation, and audit results
+
+Use the batch tabs to inspect:
+
+- **Issues** — invalid amounts, missing fields, duplicate transaction IDs, and other data-quality findings.
+- **Reconciliation** — matched records and source-only, ledger-only, duplicate-reference, and field-mismatch statuses. This tab is available when a ledger file was uploaded.
+- **Audit** — processing events and batch metadata.
+
+The reconciliation exposure metrics use the currency codes in the uploaded source data. Mixed currencies are shown separately rather than being treated as one currency.
+
+![BankDQ Pro reconciliation and audit results](docs/screenshots/03-reconciliation-audit.png)
+
 ## Use batch upload in Swagger
 
 1. Register and login; copy `access_token` from `/auth/login`.
