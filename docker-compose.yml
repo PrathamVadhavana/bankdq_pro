@@ -1,0 +1,23 @@
+services:
+  db:
+    image: postgres:16
+    environment:
+      POSTGRES_DB: bankdq
+      POSTGRES_USER: bankdq
+      POSTGRES_PASSWORD: local-dev-only
+    ports: ["5432:5432"]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U bankdq -d bankdq"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+  api:
+    build: .
+    environment:
+      DATABASE_URL: postgresql+psycopg://bankdq:local-dev-only@db:5432/bankdq
+      JWT_SECRET: local-compose-secret-change-before-use
+      LOG_LEVEL: INFO
+    ports: ["8000:8000"]
+    depends_on:
+      db:
+        condition: service_healthy
