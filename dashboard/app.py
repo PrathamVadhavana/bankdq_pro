@@ -1,7 +1,31 @@
 import os
+import time
 import requests
 import streamlit as st
 import pandas as pd
+from requests_toolbelt import MultipartEncoder, MultipartEncoderMonitor
+
+CURRENCY_SYMBOLS = {
+    "INR": "₹",
+    "USD": "$",
+    "EUR": "€",
+    "GBP": "£",
+    "JPY": "¥",
+    "CNY": "¥",
+    "AUD": "A$",
+    "CAD": "C$",
+    "SGD": "S$",
+    "AED": "د.إ",
+}
+
+def format_exposure(value: str, currencies: list[str]) -> str:
+    amount = f"{float(value):,.2f}"
+    if len(currencies) == 1:
+        code = currencies[0]
+        return f"{CURRENCY_SYMBOLS.get(code, code + ' ')}{amount}"
+    if currencies:
+        return f"Mixed ({', '.join(currencies)}) {amount}"
+    return amount
 
 st.set_page_config(page_title="BankDQ Pro", page_icon="🏦", layout="wide")
 st.title("🏦 BankDQ Pro")
@@ -56,16 +80,78 @@ with st.form("batch_upload"):
 if submitted:
     if not sources: st.error("Choose at least one source CSV.")
     else:
-        payload=[("files",(f.name,f.getvalue(),"text/csv")) for f in sources]
-        if ledger: payload.append(("ledger_file",(ledger.name,ledger.getvalue(),"text/csv")))
-        data={"name":name,"chunk_size":str(chunk_size)}
-        with st.spinner("Processing uploaded files..."):
-            r=requests.post(f"{api}/batches",headers=headers,data=data,files=payload,timeout=180)
-        if r.ok:
-            st.session_state["last_batch"]=r.json()["batch_id"]
-            st.success("Batch processed")
-            st.json(r.json())
-        else: st.error(f"{r.status_code}: {r.text}")
+        progress = st.progress(0, text="Preparing files...")
+        status = st.empty()
+        fields = [
+            ("name", name),
+            ("chunk_size", str(chunk_size)),
+            ("background", "true"),
+        ]
+        for source in sources:
+            fields.append(("files", (source.name, source.getvalue(), "text/csv")))
+        if ledger:
+            fields.append(("ledger_file", (ledger.name, ledger.getvalue(), "text/csv")))
+        encoder = MultipartEncoder(fields=fields)
+        monitor = MultipartEncoderMonitor(encoder)
+        status.info("Uploading files...")
+
+        def update_upload_progress(monitor):
+            upload_percent = int(monitor.bytes_read / monitor.len * 20)
+            progress.progress(upload_percent, text=f"Uploading files... {upload_percent * 5}%")
+
+        monitor.callback = update_upload_progress
+        try:
+            r=requests.post(
+                f"{api}/batches",
+                headers={**headers, "Content-Type": monitor.content_type},
+                data=monitor,
+                timeout=900,
+            )
+        except requests.Timeout:
+            progress.empty()
+            status.error("The API did not finish within 15 minutes. Check the API terminal before retrying; the server may still be processing this batch.")
+            r=None
+        except requests.RequestException as exc:
+            progress.empty()
+            status.error(f"Could not reach the API: {exc}")
+            r=None
+        else:
+            if r.status_code == 202:
+                job_id = r.json()["job_id"]
+                status.info("Upload complete. Processing batch...")
+                job = None
+                while job is None or job["status"] == "PROCESSING":
+                    job_response = requests.get(
+                        f"{api}/batches/jobs/{job_id}",
+                        headers=headers,
+                        timeout=30,
+                    )
+                    if not job_response.ok:
+                        status.error(f"Could not read batch progress: {job_response.text}")
+                        break
+                    job = job_response.json()
+                    progress.progress(
+                        max(20, min(99, job["progress"])),
+                        text=f"Processing batch... {job['progress']}% — {job['message']}",
+                    )
+                    if job["status"] == "PROCESSING":
+                        time.sleep(1)
+                if job and job["status"] == "COMPLETED":
+                    progress.progress(100, text="Batch completed")
+                    status.success("Batch processed successfully.")
+                    st.session_state["last_batch"] = job["batch_id"]
+                    st.json(job)
+                elif job and job["status"] == "FAILED":
+                    progress.empty()
+                    status.error(job["message"])
+            elif r.ok:
+                progress.progress(100, text="Batch completed")
+                status.success("Batch processed successfully.")
+                st.session_state["last_batch"]=r.json()["batch_id"]
+                st.json(r.json())
+            else:
+                progress.empty()
+                status.error(f"{r.status_code}: {r.text}")
 
 st.divider()
 st.subheader("Your batches")
@@ -85,12 +171,33 @@ if r.ok:
         if mr.ok:
             m=mr.json()
             st.markdown("#### Reconciliation exposure estimate")
-            st.caption(m["exposure_currency_note"])
+            has_reconciliation = d.get("reconciliation_count", 0) > 0
+            if has_reconciliation:
+                st.caption(m["exposure_currency_note"])
+            else:
+                st.info("Upload an optional ledger CSV to calculate reconciliation exposure.")
+            currencies = m.get("currencies", []) if has_reconciliation else []
             e1,e2,e3,e4=st.columns(4)
-            e1.metric("Total estimated exposure",m["financial_exposure_estimate"])
-            e2.metric("Amount mismatch",m["amount_mismatch_exposure"])
-            e3.metric("Source only",m["source_only_exposure"])
-            e4.metric("Ledger only",m["ledger_only_exposure"])
+            exposure_values = (
+                format_exposure(m["financial_exposure_estimate"], currencies)
+                if has_reconciliation else "—"
+            )
+            mismatch_values = (
+                format_exposure(m["amount_mismatch_exposure"], currencies)
+                if has_reconciliation else "—"
+            )
+            source_only_values = (
+                format_exposure(m["source_only_exposure"], currencies)
+                if has_reconciliation else "—"
+            )
+            ledger_only_values = (
+                format_exposure(m["ledger_only_exposure"], currencies)
+                if has_reconciliation else "—"
+            )
+            e1.metric("Total estimated exposure", exposure_values)
+            e2.metric("Amount mismatch", mismatch_values)
+            e3.metric("Source only", source_only_values)
+            e4.metric("Ledger only", ledger_only_values)
         tabs=st.tabs(["Issues","Reconciliation","Audit"])
         with tabs[0]:
             ir=requests.get(f"{api}/batches/{selected}/issues?page=1&page_size=200",headers=headers,timeout=15)

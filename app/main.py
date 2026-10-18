@@ -5,16 +5,20 @@ import json
 import logging
 import os
 import time
+import threading
+import uuid
+from concurrent.futures import ThreadPoolExecutor
+from io import BytesIO
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
 from typing import Annotated
 from fastapi import Depends, FastAPI, File, Form, HTTPException, UploadFile, Query
-from fastapi.responses import StreamingResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field
 from sqlalchemy import select, func, desc
 from sqlalchemy.orm import Session
-from .db import Base, engine, get_db
+from .db import Base, SessionLocal, engine, get_db
 from .models import User, Batch, TransactionRecord, QualityIssue, ReconciliationResult, AuditLog
 from .security import hash_password, verify_password, create_token, get_current_user
 
@@ -22,6 +26,10 @@ LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
 logging.basicConfig(level=LOG_LEVEL, format='{"time":"%(asctime)s","level":"%(levelname)s","logger":"%(name)s","message":"%(message)s"}')
 logger = logging.getLogger("bankdq")
 MAX_FILE_BYTES = 25 * 1024 * 1024
+BATCH_WRITE_LOCK = threading.Lock()
+ASYNC_BATCH_EXECUTOR = ThreadPoolExecutor(max_workers=1)
+ASYNC_BATCH_JOBS: dict[str, dict] = {}
+ASYNC_BATCH_JOBS_LOCK = threading.Lock()
 
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
@@ -130,6 +138,7 @@ def create_batch(
     name: Annotated[str, Form(min_length=1, max_length=180)] = "Untitled batch",
     chunk_size: Annotated[int, Form(ge=50, le=10000)] = 500,
     ledger_file: Annotated[UploadFile | None, File(description="Optional ledger/reference CSV")] = None,
+    background: Annotated[bool, Form()] = False,
     user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
@@ -137,9 +146,82 @@ def create_batch(
         raise HTTPException(400, "Upload at least one source CSV")
     if len(files) > 20:
         raise HTTPException(400, "A batch can contain at most 20 source CSV files")
+    if background:
+        uploads = [(upload.filename, upload.file.read()) for upload in files]
+        ledger_upload = (ledger_file.filename, ledger_file.file.read()) if ledger_file else None
+        job_id = str(uuid.uuid4())
+        with ASYNC_BATCH_JOBS_LOCK:
+            ASYNC_BATCH_JOBS[job_id] = {
+                "owner_id": user.id,
+                "status": "PROCESSING",
+                "progress": 15,
+                "message": "Files uploaded",
+            }
+        ASYNC_BATCH_EXECUTOR.submit(
+            _run_async_batch,
+            job_id,
+            uploads,
+            ledger_upload,
+            name,
+            chunk_size,
+            user.id,
+        )
+        return JSONResponse(
+            status_code=202,
+            content={"job_id": job_id, "status": "PROCESSING", "progress": 15},
+        )
+    return _process_batch(files, name, chunk_size, ledger_file, user, db)
+
+def _run_async_batch(job_id, uploads, ledger_upload, name, chunk_size, user_id):
+    db = SessionLocal()
+    try:
+        files = [UploadFile(file=BytesIO(content), filename=filename) for filename, content in uploads]
+        ledger_file = UploadFile(file=BytesIO(ledger_upload[1]), filename=ledger_upload[0]) if ledger_upload else None
+        user = db.get(User, user_id)
+        result = _process_batch(
+            files, name, chunk_size, ledger_file, user, db,
+            progress_callback=lambda progress, message: _update_async_job(job_id, progress, message),
+        )
+        with ASYNC_BATCH_JOBS_LOCK:
+            ASYNC_BATCH_JOBS[job_id] = {
+                "owner_id": user_id,
+                "status": "COMPLETED",
+                "progress": 100,
+                "message": "Batch completed",
+                **result,
+            }
+    except Exception:
+        with ASYNC_BATCH_JOBS_LOCK:
+            ASYNC_BATCH_JOBS[job_id] = {
+                "owner_id": user_id,
+                "status": "FAILED",
+                "progress": 100,
+                "message": "Batch processing failed",
+            }
+        logger.exception("async_batch_processing_failed")
+    finally:
+        db.close()
+
+def _update_async_job(job_id, progress, message):
+    with ASYNC_BATCH_JOBS_LOCK:
+        if job_id in ASYNC_BATCH_JOBS:
+            ASYNC_BATCH_JOBS[job_id].update(progress=progress, message=message)
+
+def _process_batch(files, name, chunk_size, ledger_file, user, db, progress_callback=None):
+    if progress_callback:
+        progress_callback(20, "Starting batch processing")
+    if not BATCH_WRITE_LOCK.acquire(timeout=60):
+        raise HTTPException(503, "Another batch is currently being processed. Try again after it finishes.")
     batch = Batch(owner_id=user.id, name=name, configured_chunk_size=chunk_size,
                   files_received=len(files) + (1 if ledger_file else 0))
-    db.add(batch); db.flush()
+    try:
+        db.add(batch)
+        db.flush()
+    except Exception:
+        db.rollback()
+        BATCH_WRITE_LOCK.release()
+        logger.exception("batch_initialization_failed")
+        raise
     seen_tx_ids: dict[str, tuple[str,int]] = {}
     seen_keys: dict[str, tuple[str,int]] = {}
     source_by_id: dict[str, list[dict]] = {}
@@ -194,6 +276,11 @@ def create_batch(
                     else: valid += 1
                     if duplicate: duplicate_count += 1
                 db.flush()
+                if progress_callback:
+                    progress_callback(
+                        min(80, 20 + int(total / max(len(rows), 1) * 50)),
+                        f"Processed {total:,} source rows",
+                    )
         if ledger_file:
             ledger_rows, ledger_name = read_csv(ledger_file)
             ledger_by_id: dict[str, list[dict]] = {}
@@ -210,6 +297,8 @@ def create_batch(
                     db.add(TransactionRecord(batch_id=batch.id, owner_id=user.id, source_file=ledger_name,
                         row_number=j, transaction_id=txid, account_id=item["account_id"], transaction_date=item["date"],
                         amount=amount, currency=item["currency"], business_key=business_key(item), record_type="LEDGER"))
+                if progress_callback:
+                    progress_callback(min(90, 60 + int((offset + chunk_size) / max(len(ledger_rows), 1) * 30)), "Processed ledger rows")
             all_ids = set(source_by_id) | set(ledger_by_id)
             for txid in sorted(all_ids):
                 srcs, ledgers = source_by_id.get(txid, []), ledger_by_id.get(txid, [])
@@ -235,16 +324,29 @@ def create_batch(
         audit(db,user.id,"BATCH_PROCESSED",batch.id,{"rows":total,"files":batch.files_received,"chunk_size":chunk_size,
               "duration_ms":round((time.perf_counter()-start)*1000,2)})
         db.commit()
+        if progress_callback:
+            progress_callback(98, "Finalizing batch results")
         logger.info(json.dumps({"event":"batch_processed","batch_id":batch.id,"owner_id":user.id,"rows":total,
             "files":batch.files_received,"chunk_size":chunk_size,"duration_ms":round((time.perf_counter()-start)*1000,2)}))
-        return {"batch_id":batch.id,"name":batch.name,"status":batch.status,"files_received":batch.files_received,
+        result = {"batch_id":batch.id,"name":batch.name,"status":batch.status,"files_received":batch.files_received,
                 "rows_received":total,"rows_valid":valid,"rows_invalid":invalid,"duplicates":duplicate_count,
                 "chunk_size":chunk_size,"duration_ms":round((time.perf_counter()-start)*1000,2),
                 "reconciliation_enabled":ledger_file is not None}
+        BATCH_WRITE_LOCK.release()
+        return result
     except Exception:
         db.rollback()
+        BATCH_WRITE_LOCK.release()
         logger.exception("batch_processing_failed")
         raise
+
+@app.get("/batches/jobs/{job_id}")
+def batch_job_status(job_id: str, user: User = Depends(get_current_user)):
+    with ASYNC_BATCH_JOBS_LOCK:
+        job = ASYNC_BATCH_JOBS.get(job_id)
+    if job is None or job.get("owner_id") != user.id:
+        raise HTTPException(404, "Batch job not found")
+    return {key: value for key, value in job.items() if key != "owner_id"}
 
 @app.get("/batches")
 def list_batches(page: int = Query(1,ge=1), page_size: int = Query(20,ge=1,le=100),
@@ -316,6 +418,12 @@ def get_audit(page: int=Query(1,ge=1), page_size: int=Query(50,ge=1,le=200),
 @app.get("/batches/{batch_id}/metrics")
 def metrics(batch_id: str, user: User=Depends(get_current_user), db: Session=Depends(get_db)):
     b=own_batch(db,batch_id,user)
+    currency_rows = db.scalars(select(TransactionRecord.currency).where(
+        TransactionRecord.batch_id == batch_id,
+        TransactionRecord.record_type == "SOURCE",
+        TransactionRecord.currency.is_not(None),
+    ).distinct()).all()
+    currencies = sorted({str(currency).upper() for currency in currency_rows if currency})
     counts=db.execute(select(ReconciliationResult.status,func.count()).where(
         ReconciliationResult.batch_id==batch_id).group_by(ReconciliationResult.status)).all()
     recon_rows=db.scalars(select(ReconciliationResult).where(
@@ -339,6 +447,7 @@ def metrics(batch_id: str, user: User=Depends(get_current_user), db: Session=Dep
         "amount_mismatch_exposure":str(amount_mismatch_exposure.quantize(Decimal("0.01"))),
         "source_only_exposure":str(source_only_exposure.quantize(Decimal("0.01"))),
         "ledger_only_exposure":str(ledger_only_exposure.quantize(Decimal("0.01"))),
+        "currencies": currencies,
         "exposure_currency_note":"Amounts use source CSV currency values; only sum comparable currencies before interpreting as one currency."}
 
 @app.get("/openapi.json")
