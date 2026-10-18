@@ -5,6 +5,7 @@ psycopg[binary]>=3.2,<4.0
 python-multipart>=0.0.9
 streamlit>=1.38
 requests>=2.32
+requests-toolbelt>=1.0,<2.0
 alembic>=1.13
 pytest>=8.0
 httpx2>=2.13,<3.0
