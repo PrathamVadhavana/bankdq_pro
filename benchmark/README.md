@@ -1,13 +1,16 @@
-# Local benchmark record
+# Reproducible benchmark outputs
 
-Measured in the project-generation environment using the bundled 1,000-row synthetic source CSV.
+Run from the repository root:
 
-- Python: 3.13.5
-- File size: 58270 bytes
-- Rows scanned per run: 1000
-- Duplicate IDs detected: 4
-- Repeats: 5
-- Median elapsed time: 0.001447 seconds
-- Median scan throughput: 690856.79 rows/second
+```cmd
+python scripts\run_benchmark_suite.py --repeats 5 --seed 42 --include-api
+```
 
-This is a local microbenchmark of CSV parsing and transaction-ID duplicate scanning only. It excludes API, database writes, authentication, and reconciliation. Re-run on your own computer before using any performance figure on your resume.
+The command generates `benchmark/results.json` and `benchmark/results.csv`.
+Those files are intentionally ignored by Git because measurements are
+machine-specific and must be regenerated in the environment being reported.
+
+The JSON separates CSV parsing, duplicate-ID scanning, and optional API
+end-to-end processing. It also contains labeled data-quality and
+reconciliation evaluation metrics. Use only observed values from a newly
+generated result file in a resume or report.

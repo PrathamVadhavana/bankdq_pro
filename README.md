@@ -17,11 +17,66 @@ BankDQ Pro demonstrates a common operational control problem: ingesting transact
 - **Operational visibility:** structured JSON logs, per-batch metrics, audit trail, paginated issue and reconciliation endpoints, CSV export.
 - **Database migration scaffold:** Alembic configuration and initial schema revision.
 - **Engineering workflow:** pytest tests, Ruff lint in GitHub Actions, Docker and Docker Compose for PostgreSQL.
-- **Repeatable benchmark script:** reports actual local CSV parse/duplicate-scan throughput to `benchmark/results.json`.
+- **Repeatable benchmark suite:** reports isolated CSV parse/duplicate-scan throughput, labeled quality/reconciliation metrics, and optional API timing to `benchmark/results.json` and `benchmark/results.csv`.
 
 ## CSV schema
 
-Required columns: `transaction_id`, `amount`. Recommended columns: `account_id`, `transaction_date` (ISO `YYYY-MM-DD`), `currency`, `description`. Header capitalization and spaces are normalized. Both source and ledger files use the same schema.
+Uploaded source and ledger files must be UTF-8 CSV files with a header row. Both
+file types use the same schema. A CSV can contain one transaction per data row;
+do not include JSON, Excel formatting, totals rows, or multiple header rows.
+
+### Copy-ready CSV format
+
+```csv
+transaction_id,account_id,transaction_date,amount,currency,description
+TX00000001,AC0000001,2026-01-15,1250.50,INR,UPI transfer
+TX00000002,AC0000002,2026-01-16,89.99,USD,POS purchase
+```
+
+### Columns
+
+| Column | Required | Expected format and rules |
+| --- | --- | --- |
+| `transaction_id` | Yes | Non-empty transaction/reference identifier. It should be unique within a source or ledger file. Duplicate IDs are reported as data-quality or reconciliation issues. |
+| `amount` | Yes | Numeric monetary value, such as `1250.50` or `1,250.50`. Values are stored with two decimal places. Missing, non-numeric, or non-finite values such as `NaN` and `Infinity` are invalid. |
+| `account_id` | Recommended | Account identifier used for reconciliation. If omitted or blank, the row receives a `MISSING_ACCOUNT_ID` issue and account-level reconciliation cannot be reliable. |
+| `transaction_date` | Recommended | ISO date in `YYYY-MM-DD` format, such as `2026-01-15`. Invalid dates receive an `INVALID_DATE` issue. |
+| `currency` | Recommended | Currency code such as `INR`, `USD`, `EUR`, or `GBP`. Values are normalized to uppercase. Use one consistent currency per comparison set; mixed currencies are not summed together. If omitted, the application defaults it to `INR`. |
+| `description` | Optional | Free-text description. It is retained for display and is limited to 500 characters. It is not used as the primary reconciliation key. |
+
+### File and header requirements
+
+- File names must end in `.csv`.
+- Files must be UTF-8 encoded; UTF-8 with a byte-order mark is also accepted.
+- The first row must contain column names.
+- Header capitalization and spaces are normalized. For example,
+  `Transaction ID` is interpreted as `transaction_id`.
+- At least `transaction_id` and `amount` must be present in the header.
+- Blank values in required columns are invalid and are reported during
+  processing.
+- A batch can contain up to 20 source CSV files and one optional ledger CSV.
+- Each uploaded file is limited to 25 MB.
+- The dashboard supports a processing chunk size from 50 to 10,000 rows.
+  Chunking affects database flushes, not CSV file-size limits or parallelism.
+
+### Source and ledger usage
+
+Upload source files as the transactions received from the source system.
+Upload the optional ledger file as the reference set for reconciliation. The
+application primarily matches records by `transaction_id`, then compares:
+
+- Amount
+- Account
+- Transaction date
+- Currency
+
+Supported reconciliation statuses include `MATCHED`, `AMOUNT_MISMATCH`,
+`ACCOUNT_MISMATCH`, `DATE_MISMATCH`, `CURRENCY_MISMATCH`, `SOURCE_ONLY`,
+`LEDGER_ONLY`, and `DUPLICATE_REFERENCE`.
+
+Rows with missing or invalid values are retained for issue reporting, but they
+may not be eligible for a reliable match. Use the exact same column names and
+format in source and ledger files where possible.
 
 ## Windows setup (Command Prompt)
 
@@ -105,12 +160,46 @@ For subsequent schema changes, create a migration with `alembic revision --autog
 
 ## Benchmark
 
+Run the isolated benchmark suite with the default 1,000, 10,000, 50,000, and
+100,000-row deterministic datasets:
+
 ```cmd
-python scripts\generate_synthetic_data.py --rows 10000 --out sample_data\generated
-python scripts\run_benchmark.py --source sample_data\generated\source_transactions.csv --repeats 5
+python scripts\run_benchmark_suite.py --repeats 5 --seed 42 --include-api
 ```
 
-This benchmark measures local CSV parsing plus transaction-ID duplicate scanning only. It is **not** end-to-end upload, database, or reconciliation throughput. Save the generated `benchmark/results.json` with the environment and date when reporting results. Results vary by hardware and Python version; never copy benchmark values from another machine.
+The suite writes:
+
+- `benchmark/results.json` — complete machine-readable results, environment,
+  dataset sizes, seed, repeated-run medians, memory observations, and
+  evaluation metrics.
+- `benchmark/results.csv` — one row per dataset and isolated benchmark stage.
+
+To run a smaller or faster local check:
+
+```cmd
+python scripts\run_benchmark_suite.py --sizes 1000 10000 --repeats 3 --include-api
+```
+
+The performance stages are deliberately separate:
+
+- **CSV parsing** measures only CSV decoding and row construction.
+- **Duplicate-ID scanning** measures only the in-memory transaction-ID scan.
+- **API batch processing** (optional `--include-api`) measures an end-to-end
+  request using a temporary SQLite database, including persistence and
+  reconciliation. It must not be compared directly with microbenchmark
+  throughput.
+
+The evaluation stages use a separate, labeled fixture. Quality metrics match
+issue code and CSV row number; duplicate groups count repeated rows after the
+first. Reconciliation metrics compare expected status labels for matched,
+amount, account, date, currency, missing-record, and duplicate-reference
+scenarios. A matched-record percentage is reported as coverage, not accuracy.
+
+All results are synthetic and local. Do not copy benchmark values from another
+machine. Record the generated JSON with the command, hardware, Python version,
+database configuration, and seed when reporting an Action-Work-Result metric.
+The suite does not use production credentials or real banking data. Peak memory
+uses Python `tracemalloc` and may not include native allocations.
 
 ## Tests and lint
 
