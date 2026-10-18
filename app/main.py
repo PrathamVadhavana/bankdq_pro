@@ -1,5 +1,6 @@
 from __future__ import annotations
 import csv, io, json, logging, os, time
+from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
 from typing import Annotated
@@ -15,13 +16,20 @@ from .security import hash_password, verify_password, create_token, get_current_
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
 logging.basicConfig(level=LOG_LEVEL, format='{"time":"%(asctime)s","level":"%(levelname)s","logger":"%(name)s","message":"%(message)s"}')
 logger = logging.getLogger("bankdq")
-app = FastAPI(title="BankDQ Pro", version="2.0.0", description="Portfolio prototype for batch data quality, reconciliation, and audit trails. Use synthetic data only.")
 MAX_FILE_BYTES = 25 * 1024 * 1024
 
-@app.on_event("startup")
-def startup():
+@asynccontextmanager
+async def lifespan(_app: FastAPI):
     # Tables are created for local convenience. Production deployments should run Alembic migrations.
     Base.metadata.create_all(bind=engine)
+    yield
+
+app = FastAPI(
+    title="BankDQ Pro",
+    version="2.0.0",
+    description="Portfolio prototype for batch data quality, reconciliation, and audit trails. Use synthetic data only.",
+    lifespan=lifespan,
+)
 
 class RegisterRequest(BaseModel):
     username: str = Field(min_length=3, max_length=80, pattern=r"^[a-zA-Z0-9_.-]+$")
